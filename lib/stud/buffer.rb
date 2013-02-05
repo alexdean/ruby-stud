@@ -77,6 +77,7 @@ module Stud
     #
     # @param [Hash] options
     def buffer_initialize(options={})
+
       if ! self.class.method_defined?(:flush)
         raise ArgumentError, "Any class including Stud::Buffer must define a flush() method."
       end
@@ -84,6 +85,7 @@ module Stud
       @buffer_config = {
         :max_items => options[:max_items] || 50,
         :max_interval => options[:max_interval] || 5,
+        :check_interval => options[:check_interval] || 0.1,
         :logger => options[:logger] || nil,
         :has_on_flush_error => self.class.method_defined?(:on_flush_error),
         :has_on_full_buffer_receive => self.class.method_defined?(:on_full_buffer_receive)
@@ -102,22 +104,16 @@ module Stud
         :outgoing_count => 0,
 
         :flush_mutex => Mutex.new,
-        # run by batch_receive
         :flush_thread => Thread.new do
           loop do
-            Thread.stop
+            Thread.pass
+            sleep(@buffer_config[:check_interval])
             buffer_flush
           end
         end,
 
-        # data for timed flushes
-        :last_flush => Time.now.to_i,
-        :timer_thread => Thread.new do
-          loop do
-            sleep(@buffer_config[:max_interval])
-            buffer_flush(:force => true)
-          end
-        end
+        # when did we last complete flushing?
+        :last_flush => Time.now.to_i
       }
 
       # events we've accumulated
@@ -169,8 +165,6 @@ module Stud
         @buffer_state[:pending_items][group] << event
         @buffer_state[:pending_count] += 1
       end
-
-      @buffer_state[:flush_thread].run if ! @buffer_state[:flush_mutex].locked?
     end
 
     # Try to flush events.

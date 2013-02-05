@@ -52,19 +52,29 @@ describe Stud::Buffer do
     end
 
     it "should block if max_items has been reached" do
-      subject = BufferSubject.new(:max_interval => 2, :max_items => 5)
+      test_start = Time.now
+
+      subject = BufferSubject.new(
+        # check for should-flush conditions (max_items or max_interval)
+        # every 2 seconds instead of every 0.1 seconds (the default)
+        :check_interval => 2,
+        :max_items => 5,
+        :max_interval => 5
+      )
 
       # set up internal state so we're full.
       subject.buffer_state[:pending_count] = 5
       subject.buffer_state[:pending_items][nil] = [1,2,3,4,5]
 
+      # when flush thread runs, it should make this call.
       subject.should_receive(:flush).with([1,2,3,4,5])
 
-      start = Time.now
+      # this call blocks until the flush thread runs.
       subject.buffer_receive(6)
 
-      # we were hung for max_interval, when the timer kicked in and cleared out some events
-      insist { Time.now-start } > 2
+      # we were hung for check_interval, when the timer kicked in and cleared
+      # out some events
+      insist { Time.now - test_start } > 2
     end
 
     it "should block while pending plus outgoing exceeds max_items" do
