@@ -59,9 +59,8 @@ module Stud
   # the moment.
   #
   # == final flush
-  # Including class should call <code>buffer_flush(:final => true)</code> during a teardown/
-  # shutdown routine (after the last call to buffer_receive) to ensure that all
-  # accumulated messages are flushed.
+  # +buffer_shutdown+ must be called after the last call to +buffer_receive+ has
+  # returned in order to ensure that all accumulated messages are flushed.
   module Buffer
 
     public
@@ -89,6 +88,7 @@ module Stud
         :has_on_flush_error => self.class.method_defined?(:on_flush_error),
         :has_on_full_buffer_receive => self.class.method_defined?(:on_full_buffer_receive)
       }
+
       @buffer_state = {
         # items accepted from including class
         :pending_items => {},
@@ -101,12 +101,18 @@ module Stud
         :outgoing_items => {},
         :outgoing_count => 0,
 
-        # ensure only 1 flush is operating at once
         :flush_mutex => Mutex.new,
+        # run by batch_receive
+        :flush_thread => Thread.new do
+          loop do
+            Thread.stop
+            buffer_flush
+          end
+        end,
 
         # data for timed flushes
         :last_flush => Time.now.to_i,
-        :timer => Thread.new do
+        :timer_thread => Thread.new do
           loop do
             sleep(@buffer_config[:max_interval])
             buffer_flush(:force => true)
@@ -116,6 +122,14 @@ module Stud
 
       # events we've accumulated
       buffer_clear_pending
+    end
+
+    # Ensure that everything has been flushed out.
+    #
+    # A call to this method is necessary after the final call to buffer_receive
+    # has been completed to ensure that all items are properly passed to +flush+.
+    def buffer_shutdown
+      buffer_flush(:final => true)
     end
 
     # Determine if +:max_items+ has been reached.
@@ -156,7 +170,7 @@ module Stud
         @buffer_state[:pending_count] += 1
       end
 
-      buffer_flush
+      @buffer_state[:flush_thread].run if ! @buffer_state[:flush_mutex].locked?
     end
 
     # Try to flush events.

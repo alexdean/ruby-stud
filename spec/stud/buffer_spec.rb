@@ -71,7 +71,7 @@ describe Stud::Buffer do
       subject = BufferSubject.new(:max_interval => 10, :max_items => 5)
 
       # flushes are slow this time.
-      subject.stub(:flush) { sleep 4 }
+      subject.stub(:flush) { sleep 3 }
 
       subject.buffer_receive(1)
       subject.buffer_receive(2)
@@ -105,7 +105,7 @@ describe Stud::Buffer do
 
       # if we waited this long, it had to be while we were blocked on the slow flush
       # this proves that outgoing items are counted when determining whether to block or not
-      insist { Time.now - start } > 3.8
+      insist { Time.now - start } > 2.9
     end
 
     it "should call on_full_buffer_receive if defined when buffer is full" do
@@ -152,6 +152,8 @@ describe Stud::Buffer do
 
       subject.buffer_receive('something')
       subject.buffer_receive('something else')
+
+      subject.buffer_shutdown
     end
 
     it "should accept optional grouping key" do
@@ -163,6 +165,8 @@ describe Stud::Buffer do
 
       subject.buffer_receive('something', 'key1')
       subject.buffer_receive('something else', 'key2')
+
+      subject.buffer_shutdown
     end
 
     it "should accept non-string grouping keys" do
@@ -173,6 +177,8 @@ describe Stud::Buffer do
 
       subject.buffer_receive('something', :key => 1, :foo => :yes)
       subject.buffer_receive('something else', :key => 2, :foo => :no)
+
+      subject.buffer_shutdown
     end
   end
 
@@ -190,6 +196,8 @@ describe Stud::Buffer do
       subject.should_receive(:flush)
 
       subject.buffer_receive('item')
+
+      subject.buffer_shutdown
     end
 
     it "should retry if no on_flush_error is defined" do
@@ -207,6 +215,8 @@ describe Stud::Buffer do
       subject.should_receive(:flush)
 
       subject.buffer_receive('item')
+
+      subject.buffer_shutdown
     end
 
     it "should return if it cannot get a lock" do
@@ -230,6 +240,8 @@ describe Stud::Buffer do
       subject.buffer_receive('one')
       subject.buffer_receive('two')
       subject.buffer_receive('three')
+
+
 
       insist { subject.buffer_flush(:force => true) } == 3
     end
