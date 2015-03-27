@@ -4,11 +4,11 @@ module Stud
   #
   # Implements a generic framework for accepting events which are later flushed
   # in batches. Flushing occurrs whenever +:max_items+ or +:max_interval+ (seconds)
-  # has been reached.
+  # has been reached or if the event size will outgrows +:flush_each+ (bytes)
   #
   # Including class must implement +flush+, which will be called with all accumulated
-  # items either when the output buffer fills (+:max_items+) or when a fixed amount
-  # of time (+:max_interval+) passes.
+  # items either when the output buffer fills (+:max_items+ or +:flush_each+)
+  # or when a fixed amount of time (+:max_interval+) passes.
   #
   # == batch_receive and flush
   # General receive/flush can be implemented in one of two ways.
@@ -73,6 +73,7 @@ module Stud
     #
     # Options:
     # * :max_items, Max number of items to buffer before flushing. Default 50.
+    # * :flush_each, Flush each bytes of buffer. Default 0 (no flushing by buffer size).
     # * :max_interval, Max number of seconds to wait between flushes. Default 5.
     # * :logger, A logger to write log messages to. No default. Optional.
     #
@@ -84,6 +85,7 @@ module Stud
 
       @buffer_config = {
         :max_items => options[:max_items] || 50,
+        :flush_each => options[:flush_each].to_i || 0,
         :max_interval => options[:max_interval] || 5,
         :logger => options[:logger] || nil,
         :has_on_flush_error => self.class.method_defined?(:on_flush_error),
@@ -93,13 +95,15 @@ module Stud
         # items accepted from including class
         :pending_items => {},
         :pending_count => 0,
+        :pending_size => 0,
 
-        # guard access to pending_items & pending_count
+        # guard access to pending_items & pending_count & pending_size
         :pending_mutex => Mutex.new,
 
         # items which are currently being flushed
         :outgoing_items => {},
         :outgoing_count => 0,
+        :outgoing_size => 0,
 
         # ensure only 1 flush is operating at once
         :flush_mutex => Mutex.new,
@@ -118,13 +122,15 @@ module Stud
       buffer_clear_pending
     end
 
-    # Determine if +:max_items+ has been reached.
+    # Determine if +:max_items+ or +:flush_each+ has been reached.
     #
     # buffer_receive calls will block while <code>buffer_full? == true</code>.
     #
     # @return [bool] Is the buffer full?
-    def buffer_full?
-      @buffer_state[:pending_count] + @buffer_state[:outgoing_count] >= @buffer_config[:max_items]
+    def buffer_full?(event_volume=0)
+      size = @buffer_state[:pending_size] + @buffer_state[:outgoing_size]
+      (@buffer_state[:pending_count] + @buffer_state[:outgoing_count] >= @buffer_config[:max_items]) || \
+      (@buffer_config[:flush_each] != 0 && size != 0 && (size + event_volume > @buffer_config[:flush_each]))
     end
 
     # Save an event for later delivery
@@ -132,7 +138,7 @@ module Stud
     # Events are grouped by the (optional) group parameter you provide.
     # Groups of events, plus the group name, are later passed to +flush+.
     #
-    # This call will block if +:max_items+ has been reached.
+    # This call will block if +:max_items+ or +:flush_each+ has been reached.
     #
     # @see Stud::Buffer The overview has more information on grouping and flushing.
     #
@@ -142,8 +148,10 @@ module Stud
     def buffer_receive(event, group=nil)
       buffer_initialize if ! @buffer_state
 
+      event_volume = @buffer_config[:flush_each] == 0 ? 0 : var_size(event)
+
       # block if we've accumulated too many events
-      while buffer_full? do
+      while buffer_full?(event_volume) do
         on_full_buffer_receive(
           :pending => @buffer_state[:pending_count],
           :outgoing => @buffer_state[:outgoing_count]
@@ -154,6 +162,7 @@ module Stud
       @buffer_state[:pending_mutex].synchronize do
         @buffer_state[:pending_items][group] << event
         @buffer_state[:pending_count] += 1
+        @buffer_state[:pending_size] += event_volume
       end
 
       buffer_flush
@@ -162,12 +171,12 @@ module Stud
     # Try to flush events.
     #
     # Returns immediately if flushing is not necessary/possible at the moment:
-    # * :max_items have not been accumulated
+    # * :max_items or :flush_each have not been accumulated
     # * :max_interval seconds have not elapased since the last flush
     # * another flush is in progress
     #
     # <code>buffer_flush(:force => true)</code> will cause a flush to occur even
-    # if +:max_items+ or +:max_interval+ have not been reached. A forced flush
+    # if +:max_items+ or +:flush_each+ or +:max_interval+ have not been reached. A forced flush
     # will still return immediately (without flushing) if another flush is
     # currently in progress.
     #
@@ -191,16 +200,20 @@ module Stud
       items_flushed = 0
 
       begin
-        time_since_last_flush = Time.now.to_i - @buffer_state[:last_flush]
-
         return 0 if @buffer_state[:pending_count] == 0
+
+        # compute time_since_last_flush only when some item is pending
+        time_since_last_flush = (Time.now.to_i - @buffer_state[:last_flush])
+
         return 0 if (!force) &&
            (@buffer_state[:pending_count] < @buffer_config[:max_items]) &&
+           (@buffer_config[:flush_each] == 0 || @buffer_state[:pending_size] < @buffer_config[:flush_each]) &&
            (time_since_last_flush < @buffer_config[:max_interval])
 
         @buffer_state[:pending_mutex].synchronize do
           @buffer_state[:outgoing_items] = @buffer_state[:pending_items]
           @buffer_state[:outgoing_count] = @buffer_state[:pending_count]
+          @buffer_state[:outgoing_size] = @buffer_state[:pending_size]
           buffer_clear_pending
         end
 
@@ -215,6 +228,7 @@ module Stud
 
         @buffer_state[:outgoing_items].each do |group, events|
           begin
+
             if group.nil?
               flush(events)
             else
@@ -224,6 +238,13 @@ module Stud
             @buffer_state[:outgoing_items].delete(group)
             events_size = events.size
             @buffer_state[:outgoing_count] -= events_size
+            if @buffer_config[:flush_each] != 0
+              events_volume = 0
+              events.each do |event|
+                events_volume += var_size(event)
+              end
+              @buffer_state[:outgoing_size] -= events_volume
+            end
             items_flushed += events_size
 
           rescue => e
@@ -255,6 +276,46 @@ module Stud
     def buffer_clear_pending
       @buffer_state[:pending_items] = Hash.new { |h, k| h[k] = [] }
       @buffer_state[:pending_count] = 0
+      @buffer_state[:pending_size] = 0
     end
+
+    # Calculate a guessed amount of memory the given variable requires
+    # Based on:
+    # - https://github.com/kaspernj/knjrbfw/blob/master/lib/knj/memory_analyzer.rb#L334
+    # - http://www.pastie.org/217131
+    # Suppose REF_SIZE = 4
+    private
+    def var_size(var)
+      if var.is_a?(String)
+        return var.bytesize
+      elsif var.is_a?(Integer)
+        return var.to_s.length
+      elsif var.is_a?(Symbol) or var.is_a?(Fixnum)
+        return 4
+      elsif var.is_a?(TrueClass) or var.is_a?(FalseClass)
+        return 1
+      elsif var.is_a?(Time)
+        return var.to_f.to_s.length
+      elsif var.is_a?(Hash)
+        size = 8 * var.size
+        var.each do |key, val|
+          size += var_size(key) + var_size(val)
+        end
+        return size
+      elsif var.is_a?(Array) or var.is_a?(Enumerable)
+        size = 4 * var.size
+        var.each do |item|
+          size += var_size(item)
+        end
+        return size
+      else # var is an object
+        size = 0
+        var.instance_variables.each do |var_name|
+          size += var_size(var.instance_variable_get(var_name)) + 4
+        end
+        return size
+      end
+    end
+
   end
 end
